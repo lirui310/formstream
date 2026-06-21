@@ -15,7 +15,7 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"SUPABASE_URL": "https://fccxmikziiimwwgxfdwf.supabase.co"
+		"SUPABASE_URL": "https://你的项目id.supabase.co"
 	},
 	"r2_buckets": [
 		{
@@ -26,7 +26,7 @@
 	"kv_namespaces": [
 		{
 			"binding": "RATE_LIMIT",
-			"id": "117301f0d13f4e4cb336852c648d5571"
+			"id": "你的 KV namespace id"
 		}
 	],
 	"queues": {
