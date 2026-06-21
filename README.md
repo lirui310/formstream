@@ -42,18 +42,90 @@
 
 ---
 
+## 部署方式说明（一定要先看这一节）
+
+在动手之前，先搞清楚一件最关键的事：**这个项目"上线"是怎么发生的？**
+
+### 不是 Git 自动部署，是你自己在电脑上手动推送
+
+很多平台（比如 Vercel、Netlify，或者 Cloudflare Pages 的某些配置）支持"把代码 push 到 GitHub，平台自动检测到变化并帮你部署"。
+
+**这个项目不是这种模式。** 它用的是 Cloudflare 官方的命令行工具 **Wrangler**，部署这个动作是你在自己电脑的终端里手动敲一条命令（`npm run deploy`）触发的，Cloudflare 不会去监听你的 GitHub 仓库。
+
+把这两件事分清楚：
+
+```
+你的电脑（写代码、改配置文件）
+   │
+   ├── git push origin main ──────────────► GitHub
+   │   （只是把代码备份到 GitHub，仅此而已。
+   │    网站不会因为这个动作有任何变化。）
+   │
+   └── npm run deploy ────────────────────► Cloudflare
+       （这条命令会在你电脑上把项目构建好，
+        然后直接上传到 Cloudflare 并让它生效。
+        这才是真正让网站"上线"/"更新"的动作。）
+```
+
+也就是说：
+
+- `git push` 推到 GitHub，**网站不会变**，那只是代码版本记录/备份
+- 只有在你自己电脑的终端里运行 `npm run deploy`（本质就是调用 `wrangler deploy`），**这一刻网站才会真正更新**
+- 这两件事互不依赖，谁先谁后都行，但缺了 `npm run deploy` 这一步，你改的代码永远不会出现在线上
+
+### "在终端执行"具体是什么意思
+
+下面所有写着要"运行"的命令，都是指：
+
+1. 打开你电脑上的终端程序（macOS 叫"终端"/Terminal，Windows 可以用 PowerShell 或者 VS Code 里自带的终端）
+2. 用 `cd` 命令进到这个项目的文件夹里（比如 `cd ~/Desktop/formstream`）
+3. 把命令完整复制粘贴进去，按回车执行
+
+不是去 Cloudflare 或 Supabase 的网页上找按钮点。本文档后面每一步都会标注清楚是要**在终端敲命令**，还是要**去网页控制台点几下**，两种操作不要搞混。
+
+### 整体流程长什么样
+
+```
+① Supabase 网页控制台          ② Cloudflare 网页控制台/终端命令
+   建数据库表、开权限策略           建 R2 存储桶 / KV / Queue 资源
+   拿到 3 个连接用的 key                  │
+        │                              │
+        └──────────────┬───────────────┘
+                        ▼
+         ③ 在你电脑的项目代码里
+         把上面拿到的东西填进配置文件、
+         配置成"密钥"（secrets）
+                        │
+                        ▼
+         ④ 本地终端运行 npm run dev
+         自己先测一遍，确认能正常注册/登录/收表单
+                        │
+                        ▼
+         ⑤ 本地终端运行 npm run deploy
+         这一步才是真正把网站发布到 Cloudflare
+                        │
+                        ▼
+              网站正式可以被任何人访问
+```
+
+记住这张图，再往下看每一步就不会迷路了。
+
+---
+
 ## 部署指南
 
-下面假设你是**第一次部署这个项目**：刚 Fork/Clone 了仓库，Cloudflare、Supabase 账号都还没配置任何东西。跟着下面的步骤一步一步做，做完就能跑起来。
+下面假设你是**第一次部署这个项目**：刚 Fork/Clone 了仓库，Cloudflare、Supabase 账号都还没配置任何东西。每一步开头都标了 **在哪里操作**，跟着做就行。
 
 ### 你需要准备
 
-- Node.js 20+、npm
-- 一个 **Cloudflare** 账号，已绑定支付方式（R2/KV 首次启用通常需要，即使用量在免费额度内）
+- 一台能上网的电脑，装好 **Node.js**（建议 20 版本以上）—— 装好之后在终端运行 `node -v` 能看到版本号就算装好了
+- 一个 **Cloudflare** 账号，已绑定支付方式（R2/KV 这两个存储功能首次启用通常要求账号绑过卡，即使实际用量在免费额度内也要绑）
 - 一个 **Supabase** 账号
-- （可选）一个域名、一个 Resend 账号——没有也能先把整个流程跑通，只是邮件通知/自定义域名用不上
+- （可选）一个域名、一个 Resend 账号——没有也能先把整个流程跑通，只是邮件通知/自定义域名暂时用不上
 
-### 第 0 步：拉代码、装依赖
+### 第 0 步：把代码拉到你电脑上
+
+📍 **在哪里操作：本地终端**
 
 ```bash
 git clone <你 fork 的仓库地址>
@@ -61,21 +133,25 @@ cd formstream
 npm install
 ```
 
+`git clone` 把代码下载到你电脑上；`cd formstream` 进入这个文件夹；`npm install` 把项目需要的依赖包都装好。装完之后，**接下来所有命令都假设你的终端当前停留在这个 `formstream` 文件夹里**。
+
 ---
 
-### 第 1 步：Supabase 端设置
+### 第 1 步：去 Supabase 把数据库建起来
+
+📍 **在哪里操作：Supabase 网页控制台**（[supabase.com](https://supabase.com)，浏览器里操作，不涉及终端命令，除了 1.2 节里跑 SQL 也是在网页里的"SQL Editor"里粘贴执行，不是本地终端）
 
 #### 1.1 建项目
 
-1. 打开 [supabase.com](https://supabase.com) → New Project
+1. 打开 [supabase.com](https://supabase.com) → 登录 → New Project
 2. 项目名随意，比如 `formstream`
-3. 数据库密码：随机生成一个强密码，存进密码管理工具——**这个项目本身用不到这个密码**（连库走 `supabase-js`/REST API，不走裸 Postgres TCP），只有你要直连数据库做运维时才用得上
+3. 数据库密码：随机生成一个强密码，存进密码管理工具——**这个项目本身用不到这个密码**（连库走的是 `supabase-js`/REST API，不走裸 Postgres 连接），只有你要直连数据库做运维时才用得上，正常部署流程不需要它
 4. Region：选离你目标用户最近的区域，建好之后不好迁移，提前想清楚
 5. Plan：开发阶段用 Free 没问题；**正式上线前必须升级到 Pro**——Free 档闲置 7 天会自动暂停项目，不适合生产环境
 
 #### 1.2 初始化数据库
 
-打开 Supabase 控制台 → **SQL Editor**，依次粘贴执行下面三段 SQL。
+项目建好后，左侧菜单找到 **SQL Editor**，依次粘贴执行下面三段 SQL（每段粘贴进编辑器，点 Run）。
 
 **① 建表**
 
@@ -157,6 +233,8 @@ create trigger on_auth_user_created
 
 **② 开启行级安全（RLS）**
 
+这一步是在限制"谁能看到谁的数据"，必须做，不然所有用户的数据互相都能看到：
+
 ```sql
 alter table public.profiles enable row level security;
 alter table public.forms enable row level security;
@@ -187,97 +265,125 @@ create policy "own usage" on public.usage
 -- audit_logs 不建任何 policy：RLS 默认拒绝所有人，只有 service_role（绕过 RLS）能读写
 ```
 
-> ⚠️ **跑完务必去 Table Editor 里肉眼确认这 6 张表真的出现了**。Supabase 的 PostgREST schema cache 偶尔会和实际建表状态不同步，SQL 没报错不代表表已经能被 API 访问——如果后面调用接口报 `Could not find the table 'xxx' in the schema cache`（错误码 `PGRST205`），先去 Table Editor 确认表是否存在，再决定要不要重新跑。
+> ⚠️ **跑完务必去左侧菜单的 Table Editor 里肉眼确认这 6 张表真的出现了。** Supabase 偶尔会出现"SQL 跑完没报错，但接口那边一时还查不到表"的情况（错误码 `PGRST205`，提示 `Could not find the table 'xxx' in the schema cache`）。如果遇到，先去 Table Editor 确认表是否存在，存在的话等一会儿重试就好。
 
-**③ 确认触发器生效（可选自查）**
+**③ 确认触发器生效（可选，自己检查一下）**
 
 ```sql
 select tgname from pg_trigger where tgname = 'on_auth_user_created';
 ```
-能查到一行说明触发器建好了——之后每个新注册用户都会自动在 `profiles` 表里生成一条记录。
+能查到一行结果，说明触发器建好了——之后每个新注册用户都会自动在 `profiles` 表里生成一条记录，不用手动处理。
 
-#### 1.3 Auth 配置
+#### 1.3 打开邮箱登录方式
 
-1. Authentication → Providers：确认 **Email** 登录方式已启用（默认就是开的）
+1. 左侧菜单 Authentication → Providers：确认 **Email** 是开启状态（新项目默认就是开的，看一眼确认即可）
 2. Authentication → URL Configuration：
-   - Site URL：先填 `http://localhost:5173`（本地开发用），部署后再换成正式域名或 `*.workers.dev` 地址
-   - Redirect URLs：跟 Site URL 保持一致即可，这个项目没用到第三方 OAuth 回调
-3. 邮件模板：用 Supabase 自带的默认模板即可（确认邮件、找回密码邮件），不需要自定义 SMTP
-4. 注意 Supabase 自带邮件发送有频率限制（免费档每小时几封），开发阶段频繁注册测试账号容易触发 `email rate limit exceeded`——这是正常现象，等一会儿重试，或者参考下方[故障排查](#故障排查)里用 Admin API 直接建已确认账号的脚本
+   - Site URL 先填 `http://localhost:5173`（本地测试用的地址），等你部署上线、拿到正式网址后再回来改成正式地址
+   - Redirect URLs 跟 Site URL 填一样的就行，这个项目没用到第三方登录跳转
+3. 邮件模板用 Supabase 自带的默认模板就够了（注册确认邮件、找回密码邮件），不需要单独配邮件服务器
+4. 提个醒：Supabase 自带的发信功能有频率限制（免费档大概每小时几封），如果你在测试阶段连续注册了好几个账号，可能会报 `email rate limit exceeded`——这是正常现象，等一会儿再试，或者看本文档最后[故障排查](#故障排查)里那段跳过邮件确认直接建账号的方法
 
-#### 1.4 拿到三个关键值
+#### 1.4 拿到 3 个关键信息，记在某个地方备用
 
-Settings → API：
+左侧菜单 Settings → API，这一页里找：
 
-| 名称 | 在哪 | 用途 |
+| 名称 | 在页面里长什么样 | 接下来要用在哪 |
 |---|---|---|
-| Project URL | Settings → API → Project URL | 填进 `wrangler.json` 的 `vars.SUPABASE_URL`（非机密） |
-| Publishable key（旧称 anon key） | Settings → API → API Keys，形如 `sb_publishable_...` | `SUPABASE_ANON_KEY`，验证用户登录态用，非机密 |
-| Secret key（旧称 service_role key） | 同上，形如 `sb_secret_...` | `SUPABASE_SERVICE_KEY`，**绕过 RLS 的最高权限密钥，绝密** |
+| Project URL | 形如 `https://abcdefgh.supabase.co` | 第 3 步要填进配置文件 |
+| Publishable key（早期版本叫 anon key） | 形如 `sb_publishable_xxxxx` | 第 4 步要配成密钥 `SUPABASE_ANON_KEY` |
+| Secret key（早期版本叫 service_role key） | 形如 `sb_secret_xxxxx` | 第 4 步要配成密钥 `SUPABASE_SERVICE_KEY`，**这个最高权限，不能泄露、不能截图发别人** |
 
-> Supabase 新版控制台把 `anon key` 改名叫 **Publishable key**，`service_role key` 改名叫 **Secret keys**（且支持创建多个，建议给这个项目单独建一个，方便以后单独吊销/轮换）。名字变了，本质没变。
+> 备注：Supabase 后台把 key 的名字改过——以前叫 `anon key`/`service_role key`，现在叫 `Publishable key`/`Secret keys`。本质是同一个东西，名字换了而已，新版还支持给一个项目建多个 Secret key（方便以后单独吊销），用默认给的那一个就行。
+
+把这 3 个值先复制粘贴存到一个临时的笔记里（比如备忘录），第 3、4 步马上要用。
 
 ---
 
-### 第 2 步：Cloudflare 端设置
+### 第 2 步：去 Cloudflare 把云资源建起来
 
-#### 2.1 账号与计费
+📍 **在哪里操作：本地终端 + Cloudflare 网页控制台**（这一步两种都有，每个小节会分别注明）
 
-- R2 / KV 首次使用通常要求账号已绑定支付方式（即使用量在免费额度内）
-- **Cloudflare Queues 在 Free 计划下也能直接用**，不需要升级 Paid：Free 档每天 10,000 次 operations 免费、消息保留期固定 24 小时；Paid 计划（$5/月起）每月 100 万次免费、保留期可配到 14 天。开发/早期阶段用 Free 就够
+#### 2.1 确认账号已经绑定支付方式
 
-#### 2.2 登录 wrangler
+📍 浏览器：登录 [dash.cloudflare.com](https://dash.cloudflare.com)，左侧 Billing 里看一下是否已绑卡。R2/KV 这两项即使用量在免费额度内，首次启用通常也会要求账号已绑定支付方式。
+
+Cloudflare Queues（队列功能）现在 **免费计划就能直接用**，不需要为了这个项目升级付费计划：免费档每天 10,000 次操作、消息保留 24 小时；付费计划（$5/月起）每月 100 万次操作、保留期可以配到 14 天。先用免费的就够。
+
+#### 2.2 让本地的命令行工具登录你的 Cloudflare 账号
+
+📍 **本地终端**：
 
 ```bash
 npx wrangler login
 ```
-会打开浏览器走 OAuth 授权，授权完本地会留一个 token，之后不用每次都登录。
 
-#### 2.3 创建 R2 bucket
+执行后会自动打开浏览器，跳到 Cloudflare 的授权页面，点"允许"。授权完终端会显示成功，以后这台电脑上就不用重复登录了。
+
+> `wrangler` 是 Cloudflare 官方的命令行工具，专门用来创建资源、部署代码。`npx wrangler xxx` 的意思是"运行项目里已经装好的 wrangler 工具，执行 xxx 这个操作"，不需要你额外单独安装它。
+
+#### 2.3 创建文件存储空间（R2）
+
+📍 **本地终端**：
 
 ```bash
 npx wrangler r2 bucket create formstream-uploads
 ```
-（名字可以自己换，但要和下一步 `wrangler.json` 里的 `bucket_name` 保持一致）
 
-#### 2.4 创建 KV namespace
+这条命令会在 Cloudflare 上创建一个叫 `formstream-uploads` 的存储桶，用来存表单提交时上传的附件文件。名字可以自己改，但如果改了要记得第 3 步配置文件里也要写一样的名字。
+
+#### 2.4 创建限流缓存空间（KV）
+
+📍 **本地终端**：
 
 ```bash
 npx wrangler kv namespace create RATE_LIMIT
 ```
-命令会返回一个 `id`，记下来，下一步要填进 `wrangler.json`。
 
-#### 2.5 创建 Queue
+执行后终端会打印出一个 `id`（一长串字符），**把这个 id 复制记下来**，第 3 步要填进配置文件。
+
+#### 2.5 创建消息队列（Queue）
+
+📍 **本地终端**：
 
 ```bash
 npx wrangler queues create formstream-notify
 ```
 
-#### 2.6 （可选）Turnstile 人机验证
+这个队列用来异步处理通知发送（钉钉/飞书/邮件等），避免表单提交时卡住等通知发完才返回。
 
-1. Cloudflare Dashboard → Turnstile → Add site
-2. Domain 填你的正式域名（没有就先填占位域名，部署后再回来改）
-3. 拿到 **Site Key**（前端表单页要嵌入用，非机密）和 **Secret Key**（后端校验用，配成 secret `TURNSTILE_SECRET`）
-4. 这一步现在跳过也不影响其他功能——但如果某个表单在后台把 "开启 Turnstile" 打开了，而 `TURNSTILE_SECRET` 没配，后端会直接拒绝这次保存（`503 TURNSTILE_UNAVAILABLE`），不会出现"开了但悄悄不生效"的情况
+#### 2.6 （可选）开启 Turnstile 人机验证
 
-#### 2.7 （可选）自定义域名
+📍 **浏览器**：Cloudflare 控制台左侧菜单找 Turnstile → Add site
 
-1. 域名先加到 Cloudflare（NS 切过来）
-2. 部署完 Worker 之后，去 Workers & Pages → 找到 `formstream` → Settings → Domains & Routes → 绑定自定义域名
-3. 没有域名也不影响部署，先用 Cloudflare 分配的 `*.workers.dev` 子域名
+1. Domain 填你的正式域名（暂时没域名可以先随便填个占位的，等真的有域名了再回来改）
+2. 创建完会拿到两个值：**Site Key**（前端页面要嵌入用的，不是机密）和 **Secret Key**（后端校验用的，第 4 步要配成密钥 `TURNSTILE_SECRET`）
 
-#### 2.8 （可选）Resend 邮件通知
+这一步现在跳过完全不影响其他功能正常使用。只有一点要注意：如果你之后在后台某个表单上把"开启 Turnstile"打开了，但又没配 `TURNSTILE_SECRET`，系统会直接拒绝保存并报错（`503 TURNSTILE_UNAVAILABLE`），而不是"开了但实际不生效"——这是故意设计成这样，避免你以为开了人机验证但其实没生效。
+
+#### 2.7 （可选）绑定自定义域名
+
+📍 **浏览器**：
+
+1. 先把你的域名加到 Cloudflare 账号里（去域名注册商那边把 NS 服务器改成 Cloudflare 给的）
+2. 等第 6 步部署完 Worker 之后，回到 Cloudflare 控制台 → Workers & Pages → 找到 `formstream` 这个 Worker → Settings → Domains & Routes → 绑定你的域名
+3. 没有域名完全不影响部署，Cloudflare 会自动给你分配一个 `xxx.workers.dev` 的免费子域名，先用这个
+
+#### 2.8 （可选）注册 Resend 用来发邮件通知
+
+📍 **浏览器**：
 
 1. 注册 [resend.com](https://resend.com)
-2. Domains → 添加发信域名，按提示在 DNS 里加 SPF/DKIM 记录（域名托管在 Cloudflare 的话直接在 Cloudflare DNS 里加）
-3. 拿到 `RESEND_API_KEY`
-4. 没有自己验证的域名也能先用默认的 `onboarding@resend.dev` 发件地址跑通流程，正式上线前换成自己验证过的域名
+2. 如果有自己的域名：Domains → 添加发信域名，按提示在 DNS 里加几条记录（域名如果也托管在 Cloudflare，直接在 Cloudflare 的 DNS 设置里加）
+3. 拿到 `RESEND_API_KEY`，第 4 步要用
+4. 没有自己验证的域名也不影响，先用 Resend 提供的默认测试发件地址跑通流程，正式对外用之前再换成自己的域名
 
 ---
 
-### 第 3 步：项目里填好绑定配置
+### 第 3 步：把刚才拿到的资源信息填进项目配置
 
-把第 2 步拿到的 R2/KV/Queue 名字和 id，以及第 1 步拿到的 Supabase Project URL，填进项目根目录的 `wrangler.json`：
+📍 **在哪里操作：本地代码编辑器**（用任何文本编辑器打开项目文件夹，不是网页操作）
+
+打开项目根目录下的 `wrangler.json` 文件，把第 1、2 步里拿到的信息填进去：
 
 ```jsonc
 {
@@ -303,196 +409,255 @@ npx wrangler queues create formstream-notify
 }
 ```
 
-改完之后重新生成类型（这一步在每次改 `wrangler.json` 绑定、或新增/修改路由之后都要做）：
+具体对应关系：
+
+- `vars.SUPABASE_URL` ← 第 1.4 步拿到的 Project URL
+- `r2_buckets[0].bucket_name` ← 第 2.3 步创建的 bucket 名字（如果没改名就是 `formstream-uploads`，跟示例一样不用改）
+- `kv_namespaces[0].id` ← 第 2.4 步终端打印出来的那个 id（这个必须改，每个人的都不一样）
+- `queues` 部分如果第 2.5 步没改队列名字，也不用改
+
+改完保存文件后，回到终端，运行：
+
+📍 **本地终端**：
 
 ```bash
 npm run cf-typegen
 ```
 
+这条命令会根据你刚改的配置重新生成一些 TypeScript 类型定义文件，让代码能正确识别这些资源。**以后每次改了 `wrangler.json` 里的资源配置，都要重新跑一下这条命令。**
+
 ---
 
 ### 第 4 步：配置密钥（Secrets）
 
-项目要用到 5 个密钥，分两套环境配置方式：
+📍 **在哪里操作：先本地代码编辑器，再本地终端**
 
-| 名称 | 说明 | 必填 |
+这一步是整个流程里最容易出问题、也最容易被忽略的一步——**密钥要配置两遍，一遍给本地开发用，一遍给线上部署用，两边互不相通**。
+
+项目一共要用到这 5 个密钥：
+
+| 名称 | 是什么 | 必填吗 |
 |---|---|---|
-| `SUPABASE_ANON_KEY` | Supabase Publishable key | ✅ |
-| `SUPABASE_SERVICE_KEY` | Supabase Secret key，绕过 RLS | ✅ |
-| `ADMIN_EMAILS` | 逗号分隔的管理员邮箱，登录时自动提权 | ✅ |
-| `RESEND_API_KEY` | 发邮件通知用 | 可选 |
-| `TURNSTILE_SECRET` | Turnstile 人机验证密钥 | 可选 |
+| `SUPABASE_ANON_KEY` | 第 1.4 步的 Publishable key | ✅ 必填 |
+| `SUPABASE_SERVICE_KEY` | 第 1.4 步的 Secret key | ✅ 必填 |
+| `ADMIN_EMAILS` | 你想用来当管理员的邮箱（逗号分隔，可以填多个） | ✅ 必填 |
+| `RESEND_API_KEY` | 第 2.8 步的 Resend key | 可选，没配就是不发邮件通知 |
+| `TURNSTILE_SECRET` | 第 2.6 步的 Turnstile Secret Key | 可选，没配就是不强制人机验证 |
 
-#### 4.1 本地开发：`.dev.vars`
+#### 4.1 本地开发用：新建一个 `.dev.vars` 文件
 
-在项目根目录创建 `.dev.vars`（已经被 `.gitignore` 排除，不会进 git，放心写真实值）：
+📍 **本地代码编辑器**：在项目根目录（跟 `wrangler.json` 同一层）新建一个文件，文件名就是 `.dev.vars`，内容填：
 
 ```
-SUPABASE_ANON_KEY=sb_publishable_xxxxx
-SUPABASE_SERVICE_KEY=sb_secret_xxxxx
-ADMIN_EMAILS=you@example.com
-RESEND_API_KEY=re_xxxxx
+SUPABASE_ANON_KEY=sb_publishable_你的真实值
+SUPABASE_SERVICE_KEY=sb_secret_你的真实值
+ADMIN_EMAILS=你的邮箱@example.com
+RESEND_API_KEY=re_你的真实值
 ```
 
-`TURNSTILE_SECRET` 没配的话留空不写就行，代码按可选处理。`npm run dev` 会自动读取这个文件。
+这个文件已经被 `.gitignore` 排除了，不会被 git 提交、不会被 push 到 GitHub 上，放心写真实值。`TURNSTILE_SECRET` 如果没配 Turnstile 就不用写这一行。
 
-#### 4.2 生产环境：`wrangler secret put`
+这个文件**只有在你本地运行 `npm run dev` 的时候才会被读取**，跟线上部署完全无关——这就是为什么下面还要再配一遍。
 
-**这一步非常容易漏掉，漏了的后果是：部署成功、页面打开直接报通用错误页（"Oops! An unexpected error occurred."），因为后端拿到的 Supabase key 是 `undefined`。**
+#### 4.2 线上部署用：在终端里逐条配置
 
-`.dev.vars` **只在本地 `npm run dev` 生效**，生产环境的密钥必须单独配置，跟代码、跟 `wrangler.json` 完全无关：
+📍 **本地终端**：
+
+> ⚠️ **这一步是上一次很多人卡住的地方**：如果漏了这一步，代码部署是会"成功"的（终端不会报错），但打开网站会直接看到一个通用错误页面（"Oops! An unexpected error occurred."），因为程序在云端找不到 Supabase 的密钥，连不上数据库。`.dev.vars` 文件**只对本地 `npm run dev` 有效，对线上部署完全没有作用**，必须用下面的命令单独配置一遍。
+
+依次运行（一条一条来，不要一次性全部粘贴）：
 
 ```bash
 npx wrangler secret put SUPABASE_ANON_KEY
-npx wrangler secret put SUPABASE_SERVICE_KEY
-npx wrangler secret put ADMIN_EMAILS
-npx wrangler secret put RESEND_API_KEY      # 可选
-npx wrangler secret put TURNSTILE_SECRET    # 可选
 ```
+运行后终端会停下来等你输入，把第 1.4 步的 Publishable key 粘贴进去，按回车。
 
-每条命令会交互式提示你输入值（不会回显在终端、不会留在 shell 历史里），粘贴值按回车即可。
+```bash
+npx wrangler secret put SUPABASE_SERVICE_KEY
+```
+同样的方式，粘贴 Secret key。
 
-确认已经配置了哪些 secret（只能看名字，看不到值）：
+```bash
+npx wrangler secret put ADMIN_EMAILS
+```
+粘贴你想当管理员的邮箱。
+
+```bash
+npx wrangler secret put RESEND_API_KEY
+```
+可选，没有 Resend key 可以跳过这条不执行。
+
+```bash
+npx wrangler secret put TURNSTILE_SECRET
+```
+可选，没配 Turnstile 可以跳过这条不执行。
+
+> 输入的内容在终端里不会显示出来（这是正常的安全设计），也不会留在终端历史记录里，正常粘贴+回车就行，不用担心"是不是输错了看不到"。
+
+全部配完后，检查一下配置了哪些（只能看到名字，看不到具体的值）：
+
 ```bash
 npx wrangler secret list
 ```
-至少要看到 `SUPABASE_ANON_KEY`、`SUPABASE_SERVICE_KEY`、`ADMIN_EMAILS` 三个，否则线上打开就会报错。
+
+至少要看到 `SUPABASE_ANON_KEY`、`SUPABASE_SERVICE_KEY`、`ADMIN_EMAILS` 这三个，否则网站上线后一定会报错。
 
 ---
 
-### 第 5 步：本地跑起来验证一遍
+### 第 5 步：本地先跑起来，自己测一遍
+
+📍 **本地终端**：
 
 ```bash
 npm run dev
 ```
 
-打开 `http://localhost:5173`，走一遍核心流程：
+终端会显示一个本地网址，一般是 `http://localhost:5173`，用浏览器打开它。这一步是在你自己电脑上跑一个临时的测试版本，**还没有发布到网上**，只有你自己能访问。
 
-1. 首页能正常打开，看到"登录"/"注册"按钮
-2. 用 `ADMIN_EMAILS` 里配的邮箱注册一个账号（注册后可能要去邮箱点确认链接才能登录，这是 Supabase 默认行为）
-3. 登录后，确认页面右上角能看到"管理员"标记（说明自动提权逻辑生效）
-4. 在后台建一个表单，拿到 `access_key`
-5. 用 curl 模拟一次提交：
+打开后，照着这个顺序测一遍：
+
+1. 首页能正常打开，能看到"登录"/"注册"按钮（如果这一步就报错，回去检查第 4.1 步 `.dev.vars` 文件内容是否正确）
+2. 用第 4 步 `ADMIN_EMAILS` 里填的邮箱注册一个账号——注册后大概率要去这个邮箱里点一下确认链接才能正式登录，这是 Supabase 默认的安全机制
+3. 登录后，看页面右上角是不是显示了"管理员"字样——显示了说明自动提权的逻辑生效了
+4. 在后台新建一个表单，会拿到一个 `access_key`（一串字符）
+5. 打开一个新的终端窗口（保持 `npm run dev` 那个窗口继续运行），用下面的命令模拟一次表单提交（把 `<access_key>` 换成你刚拿到的那个）：
    ```bash
    curl -X POST http://localhost:5173/s/<access_key> -d "name=test" -H "Accept: application/json"
    ```
-6. 回后台确认这条提交记录出现了
+6. 回到后台页面刷新一下，确认刚才这条提交记录出现了
 
-本地终端日志里如果看到 `QUEUE formstream-notify 1/1 (...)`，说明通知队列本地也跑通了。
+跑 `npm run dev` 的那个终端窗口里，如果你看到类似 `QUEUE formstream-notify 1/1 (...)` 的输出，说明通知队列在本地也跑通了。
+
+这一步全部测通过之后，才进入下一步真正发布上线。
 
 ---
 
-### 第 6 步：构建与正式部署
+### 第 6 步：正式发布上线
 
-#### 6.1 先跑一次完整检查
+📍 **本地终端**：这是真正让网站对外可访问的一步。
+
+#### 6.1 先做一次完整检查（推荐，不是必须）
 
 ```bash
 npm run check
 ```
-依次做：`tsc` 类型检查 → `react-router build` 构建 → `wrangler deploy --dry-run` 模拟部署（不会真的发布，只验证配置/绑定是否正确）。三步都过了才放心部署。
 
-#### 6.2 正式部署
+这条命令会依次做三件事：检查代码有没有明显错误 → 把项目构建一遍 → 模拟一次部署（不会真的发布，只是验证配置对不对）。三步都没报错，再进行下一步会更踏实。
+
+#### 6.2 真正发布
 
 ```bash
 npm run deploy
 ```
-构建并把 Worker 发布到 Cloudflare。命令执行完会打印出访问地址（`https://formstream.<你的账号>.workers.dev`，或你绑定的自定义域名）。
 
-#### 6.3 部署成功的标志
+**这一条命令，才是真正把代码发布到 Cloudflare、让网站对外可以访问的动作。** 它会先把项目构建一遍，然后把构建结果上传到 Cloudflare。执行完成后，终端会打印出网站的访问地址，类似这样：
 
-终端输出类似：
 ```
 Uploaded formstream (x.xx sec)
 Deployed formstream triggers (x.xx sec)
-  https://formstream.<account>.workers.dev
+  https://formstream.<你的账号>.workers.dev
 ```
+
+复制这个网址在浏览器打开，就是线上正式版本了。
+
+> 之后每次你改了代码想更新线上版本，重复运行这条 `npm run deploy` 就行——不需要重新做第 1～4 步（那些是一次性的账号/资源/密钥配置）。
 
 ---
 
-### 第 7 步：部署后验证清单
+### 第 7 步：上线后自己验证一遍
 
-部署完别急着收工，按这个清单点一遍：
+部署完别急着收工，照着这个清单点一遍，确认每个功能都正常：
 
-- [ ] 打开部署地址，首页能正常打开（不是报错页）
-- [ ] `/login`、`/register` 页面正常渲染
+- [ ] 打开部署后拿到的网址，首页能正常打开（不是报错页）
+- [ ] `/login`、`/register` 页面能正常打开
 - [ ] 用管理员邮箱注册/登录，后台显示"管理员"标记
 - [ ] 建一个测试表单，拿到 `access_key`
-- [ ] 真实提交一条数据到 `/s/<access_key>`，确认：
-  - [ ] 后台提交记录里能看到
+- [ ] 真实提交一条数据到 `https://你的网址/s/<access_key>`，确认：
+  - [ ] 后台提交记录里能看到这条数据
   - [ ] 如果配置了通知渠道，能收到通知
-- [ ] 访问 `/admin`，确认普通用户访问会被重定向、管理员能看到概览数据
-- [ ] 导出一次 CSV，确认内容正常
-- [ ] 跟一下生产日志，确认没有异常报错：
+- [ ] 访问 `/admin`，确认普通用户访问会被自动跳走、管理员账号能看到管理面板
+- [ ] 导出一次 CSV，确认下载的文件内容正常
+- [ ] 在终端运行下面这条命令，实时看线上日志，确认没有报错：
   ```bash
   npx wrangler tail
   ```
 
 ---
 
-### 首个管理员账号怎么来
+### 第一个管理员账号是怎么来的
 
-不需要在 Supabase 控制台手动改 `role` 字段：
+不需要去 Supabase 控制台手动改数据库字段，流程是自动的：
 
-1. 把要当管理员的邮箱写进 `ADMIN_EMAILS` secret（逗号分隔可以填多个）
-2. 用这个邮箱正常注册/登录一次
-3. 登录成功的那一刻，代码会自动检查邮箱是否在 `ADMIN_EMAILS` 列表里，如果是且当前还不是 admin，就把 `profiles.role` 自动改成 `admin`
-4. 之后这个账号登录就能看到"管理面板"入口
+1. 把你想当管理员的邮箱写进第 4 步的 `ADMIN_EMAILS` 密钥里（逗号分隔可以填多个邮箱）
+2. 用这个邮箱在网站上正常注册、登录一次
+3. 登录成功的那一刻，代码会自动检查："这个邮箱是不是在 `ADMIN_EMAILS` 列表里？如果是，且现在还不是管理员，就自动把它设置成管理员"
+4. 之后这个账号登录，就能在后台看到"管理面板"入口了
 
-后续增减管理员，去 `/admin/users` 页面里改对应用户的角色，或者直接在 Supabase 控制台改 `profiles.role` 字段。
+以后要增加/取消别人的管理员权限，登录管理员账号后去 `/admin/users` 页面里直接改对方的角色就行，不需要再走一遍上面的流程。
 
 ---
 
 ## 日常更新发布流程
 
+代码改完之后，正常发布一次更新，按顺序运行：
+
 ```bash
-npm run cf-typegen   # 改了 wrangler.json 绑定或新增了路由，要先跑这个
-npm run check        # 类型检查 + build + dry-run，确认没问题
-npm run deploy       # 正式发布
+npm run cf-typegen   # 如果这次改了 wrangler.json 里的资源配置或新增了页面路由，先跑这个
+npm run check        # 检查一遍没问题
+npm run deploy       # 正式发布，这一步才会真正更新线上网站
 ```
 
-- 如果这次更新涉及新的数据库字段/表：先去 Supabase SQL Editor 把 DDL 跑了，**再**部署代码，避免代码上线后找不到新字段/表
-- 如果这次更新涉及新的 secret：用 `wrangler secret put <NAME>` 更新，不需要重新部署代码，secret 更新对下一次请求立即生效
+- 如果这次更新涉及新的数据库字段/表：**先**去 Supabase SQL Editor 把对应的 SQL 跑了，**再**执行 `npm run deploy`，顺序不能反，否则代码上线后会因为找不到新字段/表而报错
+- 如果这次更新涉及新增/修改密钥：用 `npx wrangler secret put <名称>` 单独更新，不需要重新执行 `npm run deploy`，密钥更新后下一次访问立即生效
 
 ---
 
 ## 故障排查
 
-| 现象 | 原因 | 处理 |
+| 现象 | 原因 | 怎么处理 |
 |---|---|---|
-| 部署成功，打开页面直接报通用错误（"Oops! An unexpected error occurred."） | 生产环境没配 secrets（最常见！） | `npx wrangler secret list` 检查是否配了 `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_KEY`/`ADMIN_EMAILS`，没有就按第 4.2 步补上；想看具体报错可以 `npx wrangler tail` 之后刷新页面 |
-| `Could not find the table 'xxx' in the schema cache`（PGRST205） | PostgREST 没识别到刚建的表，可能是 SQL 实际没跑成功 | 去 Supabase Table Editor 肉眼确认表是否存在；不存在就重新跑 DDL，存在就等一会儿重试（schema cache 偶尔同步延迟） |
-| 注册时报 `email rate limit exceeded` | Supabase 自带邮件发送频率限制，开发阶段连续注册测试账号容易触发 | 等一会儿重试，或者用下方脚本直接通过 Admin API 建一个已确认的测试账号，跳过发信环节 |
-| 提交表单返回 404 `form not found or inactive` | `access_key` 错误，或表单被停用 | 确认 access_key 没抄错；表单状态变更会主动清缓存，正常不用等待 |
-| 提交返回 429 | 触发了限流（单 IP 20次/分，单表单120次/分） | 正常防滥用行为，等 1 分钟再试 |
-| 通知没收到 | 渠道配置错了，或者是不可重试的永久失败 | 去 `/admin/logs` 查有没有"通知渠道投递失败"记录；用渠道详情页的"测试"按钮单独测一下这个渠道 |
-| 保存表单时报 `503 TURNSTILE_UNAVAILABLE` | 开启了 Turnstile 但没配 `TURNSTILE_SECRET` | 按第 2.6 步配置 Turnstile，或者先别开这个开关 |
-| `wrangler deploy` 报绑定相关错误 | `wrangler.json` 里的 R2/KV/Queue 名字或 id 跟 Cloudflare 后台实际资源不一致 | `npx wrangler r2 bucket list` / `npx wrangler kv namespace list` / `npx wrangler queues list` 核对名字和 id |
+| 部署"成功"，但打开网站直接看到一个通用错误页（"Oops! An unexpected error occurred."） | 线上环境没配密钥（最常见的问题，几乎所有第一次部署的人都会遇到） | 运行 `npx wrangler secret list` 检查是否配了 `SUPABASE_ANON_KEY`/`SUPABASE_SERVICE_KEY`/`ADMIN_EMAILS`，没有就回到第 4.2 步补上；想看具体的报错内容，可以先运行 `npx wrangler tail`，让它保持运行，然后用浏览器重新打开一次网站，错误信息会实时打印在终端里 |
+| 报错信息里有 `Could not find the table 'xxx' in the schema cache`（错误码 `PGRST205`） | Supabase 那边一时还没识别到刚建的表 | 去 Supabase 的 Table Editor 里肉眼确认表是否真的存在；存在的话等一会儿重试，不存在就回到第 1.2 步重新跑一遍 SQL |
+| 注册账号时报 `email rate limit exceeded` | Supabase 自带的发信功能有频率限制，测试阶段连续注册多个账号容易触发 | 等一会儿重试，或者用下方脚本直接跳过邮件确认环节 |
+| 提交表单返回 404，提示 `form not found or inactive` | `access_key` 抄错了，或者这个表单被停用了 | 检查 access_key 有没有抄错；表单状态变化是即时生效的，不需要等待 |
+| 提交表单返回 429 | 触发了防滥用限流（同一 IP 每分钟最多 20 次，同一表单每分钟最多 120 次） | 这是正常的防护机制，等 1 分钟再试 |
+| 配置了通知渠道但是没收到通知 | 渠道配置错了（比如 webhook 地址填错），或者是遇到了不会重试的永久性错误 | 去后台 `/admin/logs` 页面看看有没有"通知渠道投递失败"的记录；也可以在渠道详情页点"测试"按钮单独测一下这个渠道是否配置正确 |
+| 保存表单设置时报错 `503 TURNSTILE_UNAVAILABLE` | 在后台把"开启 Turnstile"打开了，但是没有配置 `TURNSTILE_SECRET` 密钥 | 回到第 2.6 步配置好 Turnstile，或者先不要打开这个开关 |
+| 运行 `npm run deploy` 时报跟资源绑定相关的错误 | `wrangler.json` 里填的 R2/KV/Queue 的名字或 id，跟 Cloudflare 那边实际创建的资源不一致（比如复制 id 时漏了字符） | 运行 `npx wrangler r2 bucket list`、`npx wrangler kv namespace list`、`npx wrangler queues list` 分别查一下实际的名字和 id，跟 `wrangler.json` 里的逐字核对 |
+| 本地运行 `npm run dev` 起不来，或者页面提示读不到密钥 | `.dev.vars` 文件不存在，或者文件里的变量名拼错了 | 对照第 4.1 步检查这个文件是否存在、内容是否正确，变量名必须跟代码里 `workers/env.d.ts` 文件里写的完全一致（大小写也要一致） |
 
-跳过邮件确认、直接建一个已确认的测试账号（本地跑一次性脚本，不要把 service key 写进任何会提交的文件）：
+**跳过邮件确认、直接创建一个已确认状态的测试账号**（在本地新建一个临时的 `.mjs` 文件，用 Node.js 运行，运行完可以删掉这个文件——注意这段代码里的 service key 只能在自己电脑上临时用，不要把它写进任何会被提交到 git 的文件里）：
 
 ```js
 import { createClient } from "@supabase/supabase-js";
-const admin = createClient("https://你的项目.supabase.co", "你的 SUPABASE_SERVICE_KEY");
+const admin = createClient("https://你的项目id.supabase.co", "你的 SUPABASE_SERVICE_KEY");
 await admin.auth.admin.createUser({
   email: "test@example.com",
   password: "Test12345678",
   email_confirm: true,
 });
 ```
-| 本地 `npm run dev` 起不来或读不到密钥 | `.dev.vars` 不存在或键名拼错 | 对照第 4.1 步检查文件内容，键名必须跟 `workers/env.d.ts` 里声明的一致 |
+
+运行方式（在项目目录下，把代码存成比如 `create-test-user.mjs`）：
+```bash
+node create-test-user.mjs
+```
 
 ---
 
 ## 回滚
 
-Cloudflare Workers 每次 `wrangler deploy` 都会生成一个新版本。出问题需要紧急回滚：
+Cloudflare Workers 每次运行 `npm run deploy` 都会生成一个新的版本记录。如果发布之后发现问题，需要紧急回滚到上一个版本：
+
+📍 **本地终端**：
 
 ```bash
-npx wrangler deployments list   # 看历史版本
-npx wrangler rollback [版本ID]  # 回滚到指定版本（不传版本ID则回滚到上一个）
+npx wrangler deployments list   # 看看历史上有哪些版本，每个版本前面有一串 ID
+npx wrangler rollback           # 不带参数，回滚到上一个版本
+npx wrangler rollback <版本ID>  # 或者指定回滚到某个具体版本
 ```
 
-> 数据库层面没有自动回滚机制——如果某次更新包含了破坏性的 DDL（比如删字段），回滚代码并不会把数据库结构改回去，这种情况要手动写反向 SQL。**有破坏性的 DDL 变更，上线前一定要想清楚怎么退**，必要时先加字段、跑一段时间观察没问题后再删旧字段，而不是一步到位替换。
+> ⚠️ 这个回滚只针对代码本身，**数据库结构不会跟着自动回滚**。如果某次更新里包含了"删字段""删表"这种破坏性的数据库改动，回滚代码并不会把数据库结构改回去，要手动写反向的 SQL 才能恢复。所以涉及破坏性数据库改动的更新，上线前一定要想清楚怎么应对最坏情况，比较稳妥的做法是先加新字段、观察一段时间没问题后再删旧字段，而不是一步到位地替换。
 
 ---
 
@@ -500,21 +665,21 @@ npx wrangler rollback [版本ID]  # 回滚到指定版本（不传版本ID则回
 
 ```
 app/
-  routes.ts              # 路由表
+  routes.ts              # 路由表，定义每个网址对应哪个页面文件
   routes/
     home.tsx              # 首页
     login.tsx / register.tsx / logout.tsx
     dashboard/             # 用户后台（表单 CRUD、渠道管理、提交记录、用量）
     admin/                 # 管理员后台（用户/全局表单/概览/审计日志）
-  lib/                     # SSR 用的 Supabase client、session 工具
+  lib/                     # 服务端渲染时用到的 Supabase 客户端、登录态工具
 workers/
-  app.ts                   # Worker 入口：按路径分流到 Hono 或 React Router SSR
+  app.ts                   # 程序入口：根据网址路径决定交给 API 处理还是渲染页面
   api/
-    public.ts              # 公开表单提交端点 /s/:accessKey
-    forms.ts               # 用户 API /api/*
-    admin.ts               # 管理员 API /api/admin/*
-    notify-consumer.ts      # Queue 消费者，派发通知
-  lib/                     # 鉴权、限流、套餐限额、通知渠道发送等共享逻辑
+    public.ts              # 公开的表单提交接口 /s/:accessKey
+    forms.ts               # 登录用户用的接口 /api/*
+    admin.ts               # 管理员专用接口 /api/admin/*
+    notify-consumer.ts      # 处理通知发送的后台任务
+  lib/                     # 鉴权、限流、套餐限额、通知渠道发送等共用逻辑
 docs/
   FormStream-开发文档.md    # 完整架构设计、数据模型、API 设计
   前期准备清单.md            # 历史记录：账号/资源准备清单
@@ -522,17 +687,19 @@ docs/
 
 更详细的架构设计、数据模型、API 设计、安全设计见 [`docs/FormStream-开发文档.md`](docs/FormStream-开发文档.md)。
 
-## 本地开发常用命令
+## 本地开发常用命令速查
 
-```bash
-npm run dev          # 本地开发（HMR）
-npm run cf-typegen   # 重新生成 Cloudflare 绑定类型 + 路由类型
-npm run check        # 类型检查 + build + dry-run 部署
-npm run build        # 生产构建
-npm run deploy       # 构建并发布到 Cloudflare
-npx wrangler tail    # 实时查看生产日志
-```
+| 命令 | 作用 |
+|---|---|
+| `npm run dev` | 本地启动测试版本，改代码会自动刷新 |
+| `npm run cf-typegen` | 改了 `wrangler.json` 资源配置或新增页面路由后，重新生成类型 |
+| `npm run check` | 检查代码 + 构建一遍 + 模拟部署一遍，不会真的发布 |
+| `npm run build` | 正式构建（一般不需要单独运行，`deploy` 会自动包含这一步） |
+| `npm run deploy` | **真正发布到 Cloudflare，让线上网站更新** |
+| `npx wrangler tail` | 实时查看线上日志，排查问题时用 |
+| `npx wrangler secret list` | 看线上配置了哪些密钥（只显示名字） |
+| `npx wrangler deployments list` | 看历史部署版本 |
 
 ---
 
-*本 README 即本项目的完整部署文档。如果实际操作中发现某一步和现状不符（比如 Cloudflare/Supabase 控制台改版），以官方最新文档为准，并欢迎更新本文件。*
+*本 README 就是本项目的完整部署文档。如果实际操作中发现某一步和现状不符（比如 Cloudflare/Supabase 控制台改版），以官方最新文档为准，并欢迎更新本文件。*
