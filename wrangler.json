@@ -15,7 +15,35 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"VALUE_FROM_CLOUDFLARE": "Hello from Cloudflare"
+		"VALUE_FROM_CLOUDFLARE": "Hello from Cloudflare",
+		"SUPABASE_URL": "https://fccxmikziiimwwgxfdwf.supabase.co"
+	},
+	"r2_buckets": [
+		{
+			"bucket_name": "formstream-uploads",
+			"binding": "UPLOADS"
+		}
+	],
+	"kv_namespaces": [
+		{
+			"binding": "RATE_LIMIT",
+			"id": "117301f0d13f4e4cb336852c648d5571"
+		}
+	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "NOTIFY_QUEUE",
+				"queue": "formstream-notify"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "formstream-notify",
+				"max_batch_size": 10,
+				"max_retries": 5
+			}
+		]
 	}
 	/**
 	 * Smart Placement
