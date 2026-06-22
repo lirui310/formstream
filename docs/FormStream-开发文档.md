@@ -4,8 +4,8 @@
 
 | 项目 | 内容 |
 |---|---|
-| 文档版本 | **v1.1**（变更见文末「修订记录」） |
-| 状态 | 开发草案（Draft for Development） |
+| 文档版本 | **v1.2**（变更见文末「修订记录」） |
+| 状态 | M1–M4 已实现并部署（计费订阅 / 境内栈适配暂缓） |
 | 适用对象 | 后端 / 全栈开发、前端、运维 |
 | 前端模板 | **React Router Framework Starter**（`cloudflare/templates/react-router-starter-template`） |
 | 技术栈 | Cloudflare Workers / R2 / KV / Queues / Turnstile + React Router v7(SSR) + Hono + Supabase(Postgres/Auth) + Resend |
@@ -228,6 +228,7 @@ auth.users
              ├─ notification_channels (1:N)
              └─ submissions (1:N)
    └─ usage (按月)
+   └─ audit_logs (管理员/系统操作留痕，actor_id 关联用户，删用户时置空)
 ```
 
 ### 7.2 DDL
@@ -286,6 +287,18 @@ create table public.usage (
   primary key (user_id, period)
 );
 
+create table public.audit_logs (
+  id          uuid primary key default gen_random_uuid(),
+  actor_id    uuid references auth.users(id) on delete set null,  -- 系统事件可为空
+  actor_email text,
+  action      text not null,        -- user.update / user.delete / form.force_disable / channel.delivery_failed ...
+  target_type text not null,        -- user / form / notification_channel ...
+  target_id   text,
+  detail      jsonb not null default '{}',
+  created_at  timestamptz not null default now()
+);
+create index idx_audit_logs_created on public.audit_logs(created_at desc);
+
 -- 注册后自动建 profile
 create function public.handle_new_user() returns trigger language plpgsql security definer as $$
 begin
@@ -304,6 +317,8 @@ alter table public.submissions enable row level security;
 alter table public.notification_channels enable row level security;
 alter table public.profiles enable row level security;
 alter table public.usage enable row level security;
+alter table public.audit_logs enable row level security;
+-- audit_logs 不建任何 policy：RLS 默认拒绝所有人，只有 service_role（绕 RLS）能读写
 
 create policy "own profile" on public.profiles
   for select using (auth.uid() = id);
@@ -347,8 +362,11 @@ create policy "own usage" on public.usage
 | GET | `/api/forms/:id/submissions?page=&size=` | 提交记录分页 |
 | GET | `/api/forms/:id/submissions/export` | 导出 CSV |
 | DELETE | `/api/submissions/:id` | 删除提交 |
-| POST/PATCH/DELETE | `/api/forms/:id/channels`、`/api/channels/:id` | 通知渠道增改删 |
+| POST | `/api/forms/:id/channels` | 新增通知渠道 |
+| GET | `/api/forms/:id/channels` | 表单的通知渠道列表 |
+| DELETE | `/api/channels/:id` | 删除通知渠道 |
 | POST | `/api/channels/:id/test` | 测试通知 |
+| GET | `/api/me` | 我的 profile（套餐/角色/状态） |
 | GET | `/api/me/usage` | 我的用量 |
 
 ### 8.3 管理员 API（需 `role=admin`，service key）
@@ -357,12 +375,13 @@ create policy "own usage" on public.usage
 |---|---|---|
 | GET | `/api/admin/users?page=&q=` | 用户列表/搜索 |
 | GET | `/api/admin/users/:id` | 用户详情(套餐/用量/表单数) |
-| PATCH | `/api/admin/users/:id` | 改 `plan` / `status`(停用启用) |
-| DELETE | `/api/admin/users/:id` | 删除用户 |
+| PATCH | `/api/admin/users/:id` | 改 `plan` / `status`(停用启用) / `role` |
+| DELETE | `/api/admin/users/:id` | 删除用户(连带清理其 R2 附件) |
 | GET | `/api/admin/forms?q=` | 全局表单检索 |
-| PATCH | `/api/admin/forms/:id` | 强制 `is_active=false` |
-| GET | `/api/admin/stats` | 系统概览(用户数/提交量/垃圾率) |
+| PATCH | `/api/admin/forms/:id` | 强制 `is_active` 切换 |
+| GET | `/api/admin/stats` | 系统概览(用户数/提交量/垃圾率 + 近14天趋势 + Top表单) |
 | GET | `/api/admin/usage` | 用量汇总 |
+| GET | `/api/admin/logs?page=&size=` | 操作审计日志(管理员操作 + 渠道永久失败) |
 
 每个 admin 端点统一前置中间件：验 JWT → 查 `profiles.role='admin' and status='active'` → 否则 403。
 
@@ -378,8 +397,9 @@ create policy "own usage" on public.usage
 | 413 | 体/文件超限 |
 | 429 | 限流 |
 | 500 | 服务端异常 |
+| 503 | 表单开启 Turnstile 但服务端未配置 `TURNSTILE_SECRET`（`TURNSTILE_UNAVAILABLE`） |
 
-响应体：`{"success":false,"code":"FORBIDDEN","message":"..."}`
+响应体：`{"success":false,"code":"FORBIDDEN","message":"..."}`。常见业务 `code`：`QUOTA_EXCEEDED`（套餐配额超限）、`PLAN_LIMIT`（文件上传套餐限制）、`RATE_LIMITED`、`TURNSTILE_UNAVAILABLE`。
 
 ---
 
@@ -400,7 +420,12 @@ create policy "own usage" on public.usage
 配 SPF/DKIM；模板含表单名、字段表、时间、来源 IP。
 
 ### 9.5 加签参考（WebCrypto）
+> ⚠️ 钉钉与飞书加签的 **key/被签内容是相反的**，实现时极易写反（曾导致飞书渠道全部静默失败）：
+> - **钉钉**：`HMAC(key = secret, msg = "{timestamp}\n{secret}")`，结果 base64 后 **urlEncode**，拼到 URL 查询参数 `&timestamp=&sign=`。
+> - **飞书**：`HMAC(key = "{timestamp}\n{secret}", msg = 空串)`，结果 base64，`timestamp`/`sign` 放**请求体**。
+
 ```javascript
+// 钉钉：被签内容是 timestamp\nsecret，key 是 secret
 async function dingSign(secret, timestamp) {
   const key = await crypto.subtle.importKey('raw',
     new TextEncoder().encode(secret),
@@ -409,7 +434,28 @@ async function dingSign(secret, timestamp) {
     new TextEncoder().encode(`${timestamp}\n${secret}`));
   return encodeURIComponent(btoa(String.fromCharCode(...new Uint8Array(sig))));
 }
+
+// 飞书：key 是 timestamp\nsecret，被签内容是空串
+async function feishuSign(secret, timestamp) {
+  const key = await crypto.subtle.importKey('raw',
+    new TextEncoder().encode(`${timestamp}\n${secret}`),
+    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new Uint8Array(0));
+  return btoa(String.fromCharCode(...new Uint8Array(sig)));
+}
 ```
+
+### 9.6 响应判定（重要：HTTP 200 不等于送达）
+钉钉 / 飞书 / 企业微信即使消息被拒（加签错、限流、token 失效、关键词不匹配）**也返回 HTTP 200**，真正的成败在响应体的状态码字段里，必须解析判断，否则会把"被拒"误当"已送达"（曾是真实 bug）：
+
+| 平台 | 成功标志 | 可重试码（限流/系统繁忙） | 典型永久失败码 |
+|---|---|---|---|
+| 钉钉 | `errcode === 0`（注意官方示例里可能是字符串 `"0"`，解析需容错） | `-1`(系统繁忙)、`90030`/`130101`/`410100`/`450101`(各版本限流码) | `310000`(加签/关键词)、`300005`(token) |
+| 飞书 | `code === 0`（新）或 `StatusCode === 0`（旧机器人） | `99991400`/`11232`，以及 HTTP 429 | `19021`(加签失败) |
+| 企业微信 | `errcode === 0` | `45009`(频率超限) | `40008`(消息格式错) |
+
+- 通用 webhook：用户自有端点，响应体格式未知，只能按 HTTP 状态码判定（2xx 视为成功）。
+- 可重试失败 → 交回队列指数退避重试；永久失败 → 不重试，写入 `audit_logs`（`action=channel.delivery_failed`）让用户/管理员能在 `/admin/logs` 看到。
 
 ---
 
@@ -507,8 +553,10 @@ app/
 workers/
   app.ts                 # 入口分流: /s/ /api/ → Hono, 其余 → React Router
   api/                   # Hono: 公开端点 + /api/* + /api/admin/*
-wrangler.jsonc
+wrangler.json
 ```
+
+> 实际目录结构以仓库根 `README.md` 的「项目结构」一节为准（这里只是设计期示意）。
 
 ### 12.3 wrangler 绑定（在模板基础上补）
 ```jsonc
@@ -560,12 +608,13 @@ wrangler.jsonc
 
 ## 14. 开发里程碑
 
-| 阶段 | 范围 |
-|---|---|
-| **M1 MVP** | 入口分流 + 公开端点(收+校验+写库) + 单渠道通知 + 注册登录 + 用户后台(建表单/看提交) |
-| **M2** | 多渠道通知 + 加签 + 队列重试 + Turnstile + 限流 + 文件上传 |
-| **M3** | **管理员角色 + 管理面板**(用户/全局表单/概览) + 套餐软限制 + 用量统计 + CSV 导出 + 渠道测试 |
-| **M4(可选)** | 计费订阅 + 操作日志/审计 + 分析面板 + 境内栈适配 |
+| 阶段 | 范围 | 状态 |
+|---|---|---|
+| **M1 MVP** | 入口分流 + 公开端点(收+校验+写库) + 单渠道通知 + 注册登录 + 用户后台(建表单/看提交) | ✅ 已完成 |
+| **M2** | 多渠道通知 + 加签 + 队列重试 + Turnstile + 限流 + 文件上传 | ✅ 已完成 |
+| **M3** | **管理员角色 + 管理面板**(用户/全局表单/概览) + 套餐软限制 + 用量统计 + CSV 导出 + 渠道测试 | ✅ 已完成 |
+| **M4** | 操作日志/审计 + 分析面板(提交趋势/Top表单) | ✅ 已完成 |
+| **M4(暂缓)** | 计费订阅 + 境内栈适配(换云厂商/ICP 备案) | ⏸ 暂未做 |
 
 ---
 
@@ -582,6 +631,7 @@ Formspree / Web3Forms；Cloudflare Workers / Static Assets / R2 / KV / Queues / 
 |---|---|
 | v1.0 | 初稿（Vite+React + Pages 设想） |
 | **v1.1** | 前端改 **React Router SSR 模板**；**去掉 Pages**，单 Worker 入口分流；明确**多租户**；新增**角色与权限模型(user/admin)**、管理面板、`/api/admin/*`、`profiles.role/status`、ADMIN_EMAILS 引导；部署改为 React Router 模板流程 |
+| **v1.2** | 对齐实际发布的代码：§7 补 `audit_logs` 表 + RLS；§8 补 `/api/me`、`/api/forms/:id/channels`、`/api/admin/logs` 端点与 503 错误码；§9 新增「响应判定（HTTP 200≠送达，需解析 errcode/code）」并补全飞书加签示例与钉钉/飞书 key↔被签内容方向提醒；§14 标注 M1–M4 完成状态。部署流程已统一到仓库根 `README.md` |
 
 ---
 

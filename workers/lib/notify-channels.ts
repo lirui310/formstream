@@ -27,11 +27,59 @@ async function hmacSha256Base64(secret: string, message: string): Promise<string
 	return btoa(String.fromCharCode(...new Uint8Array(sig)));
 }
 
-async function interpretResponse(res: Response): Promise<DispatchResult> {
+/** Plain HTTP-status interpretation — for the generic user webhook, where we don't
+ * know the response body schema, so a 2xx is the best success signal we have. */
+async function interpretHttpResponse(res: Response): Promise<DispatchResult> {
 	if (res.ok) return { ok: true, status: res.status, retryable: false };
-	// 429 = IM platform rate limit (docs §9: dingtalk ~20/min, feishu ~100/min, wework ~20/min); 5xx = transient.
 	const retryable = res.status === 429 || res.status >= 500;
 	return { ok: false, status: res.status, retryable, error: await res.text().catch(() => res.statusText) };
+}
+
+/** Reads a status code that platforms encode as either a JSON number or a numeric
+ * string (Dingtalk's docs show `errcode` as the string `"0"` in places). */
+function toStatusCode(value: unknown): number | undefined {
+	if (typeof value === "number") return value;
+	if (typeof value === "string" && value.trim() !== "" && Number.isFinite(Number(value))) return Number(value);
+	return undefined;
+}
+
+/**
+ * Dingtalk / Feishu / WeCom all return **HTTP 200 even when the message is rejected**
+ * (bad sign, rate limit, expired token, keyword filter); the real outcome is a status
+ * code in the JSON body where 0 = success. Checking only `res.ok` would report a
+ * rejected message as "delivered", so we must parse the body's status code.
+ *
+ * `successFields` lists the body field(s) that carry that code (dingtalk/wecom use
+ * `errcode`, feishu uses `code` on new bots and `StatusCode` on old ones).
+ * `retryableCodes` are the non-zero codes worth retrying via the queue (rate limits
+ * plus transient "system busy" errors); every other non-zero code is treated as a
+ * permanent config error that retrying won't fix.
+ */
+async function interpretImResponse(
+	res: Response,
+	successFields: string[],
+	retryableCodes: number[],
+): Promise<DispatchResult> {
+	if (!res.ok) {
+		const retryable = res.status === 429 || res.status >= 500;
+		return { ok: false, status: res.status, retryable, error: await res.text().catch(() => res.statusText) };
+	}
+
+	let body: Record<string, unknown>;
+	try {
+		body = (await res.json()) as Record<string, unknown>;
+	} catch {
+		return { ok: false, status: res.status, retryable: false, error: "IM platform returned a non-JSON response" };
+	}
+
+	const code = successFields.map((f) => toStatusCode(body[f])).find((c) => c !== undefined);
+	if (code === 0) return { ok: true, status: res.status, retryable: false };
+	return {
+		ok: false,
+		status: res.status,
+		retryable: code !== undefined && retryableCodes.includes(code),
+		error: JSON.stringify(body),
+	};
 }
 
 /** Dingtalk custom bot: https://oapi.dingtalk.com/robot/send?access_token=xxx, signed via §9.1/9.5. */
@@ -53,7 +101,10 @@ async function sendDingtalk(config: Record<string, unknown>, text: string): Prom
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ msgtype: "text", text: { content: text } }),
 	});
-	return interpretResponse(res);
+	// Retryable: -1 (system busy) + the various rate-limit codes Dingtalk returns across
+	// API versions/contexts (90030 "webhook over limit", 130101 "send too fast",
+	// 410100, 450101). Sign/keyword/token/param errors are permanent and fail fast.
+	return interpretImResponse(res, ["errcode"], [-1, 90030, 130101, 410100, 450101]);
 }
 
 /** Feishu custom bot: https://open.feishu.cn/open-apis/bot/v2/hook/xxx, signed via §9.2/9.5. */
@@ -66,7 +117,9 @@ async function sendFeishu(config: Record<string, unknown>, text: string): Promis
 	if (secret) {
 		const timestamp = Math.floor(Date.now() / 1000).toString();
 		body.timestamp = timestamp;
-		body.sign = await hmacSha256Base64(secret, `${timestamp}\n${secret}`);
+		// Feishu signs an *empty* payload using `${timestamp}\n${secret}` as the HMAC
+		// key — key and message are the opposite way around from Dingtalk's scheme.
+		body.sign = await hmacSha256Base64(`${timestamp}\n${secret}`, "");
 	}
 
 	const res = await fetch(webhookUrl, {
@@ -74,7 +127,8 @@ async function sendFeishu(config: Record<string, unknown>, text: string): Promis
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(body),
 	});
-	return interpretResponse(res);
+	// New bots succeed with code 0, old bots with StatusCode 0; 99991400/11232 = rate limit → retry.
+	return interpretImResponse(res, ["code", "StatusCode"], [99991400, 11232]);
 }
 
 /** WeCom (企业微信) group bot: no signing, the webhook key itself is the secret (§9.3). */
@@ -87,7 +141,8 @@ async function sendWework(config: Record<string, unknown>, text: string): Promis
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ msgtype: "text", text: { content: text } }),
 	});
-	return interpretResponse(res);
+	// errcode 45009 = "api freq out of limit" (rate limited) → retry; 40008 etc. are permanent.
+	return interpretImResponse(res, ["errcode"], [45009]);
 }
 
 /** Generic webhook: POST the raw submission as JSON, no platform-specific envelope. */
@@ -100,7 +155,7 @@ async function sendWebhook(config: Record<string, unknown>, payload: Record<stri
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(payload),
 	});
-	return interpretResponse(res);
+	return interpretHttpResponse(res);
 }
 
 async function sendEmail(
